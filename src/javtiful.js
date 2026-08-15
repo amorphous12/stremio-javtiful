@@ -41,26 +41,19 @@ function parseCards(html) {
   const items = [];
   const seen = new Set();
 
-  // article.front-video-card
   const articleRe = /<article[^>]*class="[^"]*front-video-card[^"]*"[^>]*>([\s\S]*?)<\/article>/gi;
   let m;
   while ((m = articleRe.exec(html)) !== null) {
     const body = m[1];
-
-    // Skip partner cards
     if (html.substring(m.index, m.index + 200).includes('front-partner-card')) continue;
 
-    // href
     const hrefM = body.match(/<a[^>]+href="([^"]+)"/i);
     if (!hrefM) continue;
     const href = hrefM[1].startsWith('http') ? hrefM[1] : BASE + hrefM[1];
-
-    // slug từ URL
     const slug = href.replace(/^.*javtiful\.com\//, '').replace(/\/$/, '').replace(/\//g, '__');
     if (!slug || seen.has(slug)) continue;
     seen.add(slug);
 
-    // poster
     let poster = '';
     const imgM = body.match(/<img[^>]+>/i);
     if (imgM) {
@@ -74,7 +67,6 @@ function parseCards(html) {
       }
     }
 
-    // title
     let title = '';
     const titleA = body.match(/<a[^>]+class="[^"]*front-video-title[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
     if (titleA) title = titleA[1].replace(/<[^>]+>/g, '').trim();
@@ -91,6 +83,49 @@ function parseCards(html) {
   return items;
 }
 
+// ── Parse actress / tag / category / channel ──────────────────────────────────
+function parseVideoTags(html) {
+  if (!html) return [];
+  const items = [];
+  const seen = new Set();
+
+  // Actresses
+  const actressRe = /<a[^>]+href="(\/vn\/actress\/[^"]+)"[^>]*class="front-watch-actor-card"[^>]*>[\s\S]*?<span>([^<]+)<\/span>/gi;
+  let m;
+  while ((m = actressRe.exec(html)) !== null) {
+    const url = BASE + m[1];
+    const label = 'Diễn viên: ' + m[2].trim();
+    if (!seen.has(url)) { seen.add(url); items.push({ label, url }); }
+  }
+
+  // Search tags
+  const tagRe = /<a[^>]+href="(\/vn\/search\?q=[^"]+)"[^>]*>([^<]+)<\/a>/gi;
+  while ((m = tagRe.exec(html)) !== null) {
+    const url = BASE + m[1];
+    const label = 'Tag: ' + m[2].trim();
+    if (label.trim() && !seen.has(url)) { seen.add(url); items.push({ label, url }); }
+  }
+
+  // Categories
+  const catRe = /<a[^>]+href="(\/vn\/category\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
+  while ((m = catRe.exec(html)) !== null) {
+    const url = BASE + m[1];
+    const label = 'Danh mục: ' + m[2].trim();
+    if (label.trim() && !seen.has(url)) { seen.add(url); items.push({ label, url }); }
+  }
+
+  // Channels
+  const chanRe = /<a[^>]+href="(\/vn\/channel\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
+  while ((m = chanRe.exec(html)) !== null) {
+    const url = BASE + m[1];
+    const label = 'Kênh: ' + m[2].trim();
+    if (label.trim() && !seen.has(url)) { seen.add(url); items.push({ label, url }); }
+  }
+
+  console.log('[Javtiful] parseVideoTags →', items.length, 'tags');
+  return items;
+}
+
 // ── Danh sách theo URL ────────────────────────────────────────────────────────
 async function getList(url, page = 1) {
   const sep = url.includes('?') ? '&' : '?';
@@ -98,6 +133,18 @@ async function getList(url, page = 1) {
   const key = `list_${fullUrl}`;
   const c = listCache.get(key); if (c) return c;
   console.log('[Javtiful] getList:', fullUrl);
+  const html = await fetchHtml(fullUrl);
+  const r = parseCards(html);
+  listCache.set(key, r); return r;
+}
+
+// ── Theo tag / actress / category URL ────────────────────────────────────────
+async function getByTag(tagUrl, page = 1) {
+  const sep = tagUrl.includes('?') ? '&' : '?';
+  const fullUrl = page > 1 ? `${tagUrl}${sep}page=${page}` : tagUrl;
+  const key = `tag_${fullUrl}`;
+  const c = listCache.get(key); if (c) return c;
+  console.log('[Javtiful] getByTag:', fullUrl);
   const html = await fetchHtml(fullUrl);
   const r = parseCards(html);
   listCache.set(key, r); return r;
@@ -112,6 +159,19 @@ async function search(keyword, page = 1) {
   const html = await fetchHtml(url);
   const r = parseCards(html);
   listCache.set(key, r); return r;
+}
+
+// ── Lấy related tags từ slug phim ────────────────────────────────────────────
+async function getRelatedTags(slug) {
+  const key = `tags_${slug}`;
+  const c = detailCache.get(key); if (c) return c;
+  const path = slug.replace(/__/g, '/');
+  const url = `${BASE}/${path}`;
+  const html = await fetchHtml(url);
+  if (!html) return [];
+  const tags = parseVideoTags(html);
+  detailCache.set(key, tags);
+  return tags;
 }
 
 // ── Lấy stream từ frontWatchConfig ───────────────────────────────────────────
@@ -131,7 +191,9 @@ async function getStream(slug) {
   // Path A: frontWatchConfig JSON
   if (html.includes('frontWatchConfig')) {
     try {
-      const raw = html.split('id="frontWatchConfig" type="application/json">')[1].split('</script>')[0];
+      const raw = html
+        .split('id="frontWatchConfig" type="application/json">')[1]
+        .split('</script>')[0];
       const config = JSON.parse(raw);
       const srcs = config.playerSources || [];
       sources = srcs.map(s => ({
@@ -145,7 +207,7 @@ async function getStream(slug) {
     }
   }
 
-  // Path B: tìm m3u8 trực tiếp trong HTML
+  // Path B: tìm m3u8 trực tiếp
   if (!sources.length) {
     const m3u8s = [...html.matchAll(/https?:\/\/[^"' >]+\.m3u8[^"' >]*/g)];
     if (m3u8s.length) {
@@ -159,16 +221,18 @@ async function getStream(slug) {
     return null;
   }
 
-  // Sort theo size giảm dần (chất lượng cao nhất trước)
+  // Sort theo size giảm dần
   sources.sort((a, b) => (b.size || 0) - (a.size || 0));
 
-  // Parse title + poster
   const titleM = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
   const title = titleM ? titleM[1].replace(/<[^>]+>/g, '').trim() : slug.split('__').pop();
   const posterM = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i);
   const poster = posterM ? posterM[1] : '';
 
-  const result = { sources, title, poster, url };
+  // Parse tags cho related
+  const tags = parseVideoTags(html);
+
+  const result = { sources, title, poster, url, tags };
   detailCache.set(key, result);
   return result;
 }
@@ -187,22 +251,26 @@ function toMeta(item) {
 }
 
 const CATALOGS = [
-  { id: 'newest',      url: `${BASE}/vn/videos`,                          name: '🆕 Mới Nhất' },
-  { id: 'mostviewed',  url: `${BASE}/vn/videos?sort=most_viewed`,         name: '🔥 Xem Nhiều Nhất' },
-  { id: 'toprated',    url: `${BASE}/vn/videos?sort=top_rated`,           name: '⭐ Đánh Giá Cao' },
-  { id: 'uncensored',  url: `${BASE}/vn/uncensored`,                      name: '🔞 Không Kiểm Duyệt' },
-  { id: 'mosaic',      url: `${BASE}/vn/reducing-mosaic`,                 name: '🎭 Giảm Kiểm Duyệt' },
-  { id: 'milf',        url: `${BASE}/vn/category/milf`,                   name: '👩 MILF' },
-  { id: 'bigtits',     url: `${BASE}/vn/category/big-tits`,               name: '💫 Ngực Lớn' },
-  { id: 'amateur',     url: `${BASE}/vn/category/amateur`,                name: '🎬 Nghiệp Dư' },
-  { id: 'nurse',       url: `${BASE}/vn/category/nurse`,                  name: '💉 Y Tá' },
-  { id: 'student',     url: `${BASE}/vn/category/female-student`,         name: '📚 Nữ Sinh' },
-  { id: 'office',      url: `${BASE}/vn/category/office-lady`,            name: '💼 Nhân Viên VP' },
-  { id: 'mature',      url: `${BASE}/vn/category/mature-woman`,           name: '🌸 Phụ Nữ Trưởng Thành' },
-  { id: 'cosplay',     url: `${BASE}/vn/category/cosplay`,                name: '🎀 Cosplay' },
-  { id: 'married',     url: `${BASE}/vn/category/married-woman`,          name: '💍 Phụ Nữ Có Chồng' },
-  { id: 'teacher',     url: `${BASE}/vn/category/female-teacher`,         name: '👩‍🏫 Nữ Giáo Viên' },
-  { id: 'chinese',     url: `${BASE}/vn/category/chinese-av`,             name: '🇨🇳 AV Trung Quốc' },
+  { id: 'newest',     url: `${BASE}/vn/videos`,                        name: '🆕 Mới Nhất' },
+  { id: 'mostviewed', url: `${BASE}/vn/videos?sort=most_viewed`,       name: '🔥 Xem Nhiều Nhất' },
+  { id: 'toprated',   url: `${BASE}/vn/videos?sort=top_rated`,         name: '⭐ Đánh Giá Cao' },
+  { id: 'uncensored', url: `${BASE}/vn/uncensored`,                    name: '🔞 Không Kiểm Duyệt' },
+  { id: 'mosaic',     url: `${BASE}/vn/reducing-mosaic`,               name: '🎭 Giảm Kiểm Duyệt' },
+  { id: 'milf',       url: `${BASE}/vn/category/milf`,                 name: '👩 MILF' },
+  { id: 'bigtits',    url: `${BASE}/vn/category/big-tits`,             name: '💫 Ngực Lớn' },
+  { id: 'amateur',    url: `${BASE}/vn/category/amateur`,              name: '🎬 Nghiệp Dư' },
+  { id: 'nurse',      url: `${BASE}/vn/category/nurse`,                name: '💉 Y Tá' },
+  { id: 'student',    url: `${BASE}/vn/category/female-student`,       name: '📚 Nữ Sinh' },
+  { id: 'office',     url: `${BASE}/vn/category/office-lady`,          name: '💼 Nhân Viên VP' },
+  { id: 'mature',     url: `${BASE}/vn/category/mature-woman`,         name: '🌸 Phụ Nữ Trưởng Thành' },
+  { id: 'cosplay',    url: `${BASE}/vn/category/cosplay`,              name: '🎀 Cosplay' },
+  { id: 'married',    url: `${BASE}/vn/category/married-woman`,        name: '💍 Phụ Nữ Có Chồng' },
+  { id: 'teacher',    url: `${BASE}/vn/category/female-teacher`,       name: '👩‍🏫 Nữ Giáo Viên' },
+  { id: 'chinese',    url: `${BASE}/vn/category/chinese-av`,           name: '🇨🇳 AV Trung Quốc' },
+  { id: 'related',    url: '',                                          name: '🔗 Phim Liên Quan' },
 ];
 
-module.exports = { getList, search, getStream, toMeta, CATALOGS };
+module.exports = {
+  getList, getByTag, search, getStream, getRelatedTags,
+  parseVideoTags, toMeta, CATALOGS,
+};
