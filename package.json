@@ -1,0 +1,19 @@
+{
+  "name": "stremio-javtiful",
+  "version": "1.0.0",
+  "description": "Stremio addon cho Javtiful",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.10",
+    "axios": "^1.6.0",
+    "node-cache": "^5.1.2",
+    "tough-cookie": "^4.1.3",
+    "axios-cookiejar-support": "^4.0.7"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
