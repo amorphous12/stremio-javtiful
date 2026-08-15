@@ -2,24 +2,34 @@
 const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
 const javtiful = require('./javtiful');
 
+const ADDON_URL = 'https://stremio-javtiful.onrender.com';
 const EXTRA_BASE = [{ name: 'skip' }, { name: 'search' }];
+const EXTRA_SEARCH_ONLY = [{ name: 'search' }];
 
-// Map catalog id → URL
 const CATALOG_URL = {};
 javtiful.CATALOGS.forEach(c => { CATALOG_URL[c.id] = c.url; });
 
 const manifest = {
   id: 'community.javtiful.com',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'Javtiful',
   description: 'Xem JAV từ Javtiful — Uncensored, MILF, Amateur và nhiều thể loại',
   logo: 'https://javtiful.com/favicon.ico',
-  catalogs: javtiful.CATALOGS.map(c => ({
-    id: c.id,
-    type: 'movie',
-    name: c.name,
-    extra: EXTRA_BASE,
-  })),
+  catalogs: [
+    ...javtiful.CATALOGS.filter(c => c.id !== 'related').map(c => ({
+      id: c.id,
+      type: 'movie',
+      name: c.name,
+      extra: EXTRA_BASE,
+    })),
+    // Catalog related — dùng search để truyền tag URL
+    {
+      id: 'related',
+      type: 'movie',
+      name: '🔗 Phim Liên Quan',
+      extra: EXTRA_SEARCH_ONLY,
+    },
+  ],
   resources: ['catalog', 'meta', 'stream'],
   types: ['movie'],
   idPrefixes: ['javtiful:'],
@@ -31,7 +41,13 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
   const page = Math.floor((parseInt(extra.skip) || 0) / 24) + 1;
   let items = [];
   try {
-    if (extra.search) {
+    if (id === 'related') {
+      // extra.search chứa tag URL được encode
+      if (!extra.search) return { metas: [] };
+      const tagUrl = decodeURIComponent(extra.search);
+      console.log('[catalog] related tagUrl:', tagUrl);
+      items = await javtiful.getByTag(tagUrl, page);
+    } else if (extra.search) {
       items = await javtiful.search(extra.search, page);
     } else {
       const url = CATALOG_URL[id];
@@ -51,14 +67,31 @@ builder.defineMetaHandler(async ({ type, id }) => {
     const slug = id.replace('javtiful:', '');
     const data = await javtiful.getStream(slug);
     if (!data) return { meta: null };
-    return { meta: {
+
+    const meta = {
       id,
       type: 'movie',
       name: data.title || slug,
       poster: data.poster || '',
       background: data.poster || '',
-    }};
-  } catch(e) { return { meta: null }; }
+      description: '',
+      language: 'ja',
+    };
+
+    // Thêm links related (actress, tag, category, channel)
+    if (data.tags && data.tags.length > 0) {
+      meta.links = data.tags.slice(0, 15).map(t => ({
+        name: t.label,
+        category: t.label.split(':')[0].trim(),
+        url: `stremio:///discover/${encodeURIComponent(ADDON_URL + '/manifest.json')}/movie/related?search=${encodeURIComponent(t.url)}`,
+      }));
+    }
+
+    return { meta };
+  } catch(e) {
+    console.error('[meta] error:', e.message);
+    return { meta: null };
+  }
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -66,6 +99,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
   try {
     const slug = id.replace('javtiful:', '');
     const data = await javtiful.getStream(slug);
+
     if (!data || !data.sources.length) {
       const path = slug.replace(/__/g, '/');
       return { streams: [{
