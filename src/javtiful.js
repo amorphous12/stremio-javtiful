@@ -25,9 +25,11 @@ function unescape(s) {
 async function getPage(url) {
   try {
     const r = await SESSION.get(url);
-    return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    const html = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    console.log('[Javtiful] getPage OK:', url, 'len:', html.length);
+    return html;
   } catch(e) {
-    console.error('[Javtiful] getPage error:', url, e.message);
+    console.error('[Javtiful] getPage ERROR:', url, e.message);
     return '';
   }
 }
@@ -40,7 +42,6 @@ function parseCards(html) {
     const snippet = html.substring(m.index, m.index + 200);
     if (/video-card--partner|front-partner-card/.test(snippet)) continue;
     const body = m[1];
-
     let href = '';
     const hrefM = body.match(/<a[^>]+href="((?:https?:\/\/javtiful\.com)?\/(?:[a-z]{2}\/)?video\/[^"]+)"/i);
     if (hrefM) { href = hrefM[1].trim(); }
@@ -51,12 +52,11 @@ function parseCards(html) {
     if (!href) continue;
     if (href.startsWith('http') && !href.includes('javtiful.com')) continue;
     if (!href.startsWith('http')) href = MAIN_URL + href;
-
     let poster = '';
     const imgM = body.match(/<img[^>]+>/i);
     if (imgM) {
       const imgTag = imgM[0];
-      for (const attr of ['data-front-lazy-src', 'data-front-lazy-current-src', 'src']) {
+      for (const attr of ['data-front-lazy-src','data-front-lazy-current-src','src']) {
         const rawM = imgTag.match(new RegExp(attr + '="([^"]+)"', 'i'));
         if (rawM) {
           poster = rawM[1];
@@ -66,27 +66,39 @@ function parseCards(html) {
         }
       }
     }
-
     let title = '';
     const titleM1 = body.match(/class="[^"]*video-card__title[^"]*"[^>]*title="([^"]+)"/i);
     if (titleM1) title = unescape(titleM1[1]).trim();
     if (!title) {
       const titleM2 = body.match(/class="[^"]*(?:video-card__title|front-video-title)[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
-      if (titleM2) title = unescape(titleM2[1].replace(/<[^>]+>/g, '')).trim();
+      if (titleM2) title = unescape(titleM2[1].replace(/<[^>]+>/g,'')).trim();
     }
     if (!title) {
       const altM = body.match(/\balt="([^"]+)"/i);
-      if (altM) title = unescape(altM[1].replace(/^Thumbnail\s+for\s+/i, '')).trim();
+      if (altM) title = unescape(altM[1].replace(/^Thumbnail\s+for\s+/i,'')).trim();
     }
-    if (!title) title = href.replace(/\/$/, '').split('/').pop().replace(/-/g, ' ');
-
+    if (!title) title = href.replace(/\/$/, '').split('/').pop().replace(/-/g,' ');
     results.push({ title, href, poster });
   }
   return results;
 }
 
 function extractSources(html) {
-  // Method 1: fast-stream.jav.si <source> tags
+  // Log 500 ký tự quanh vị trí quan trọng để debug
+  const hasFastStream = html.includes('fast-stream.jav.si');
+  const hasFrontWatch = html.includes('frontWatchConfig');
+  const hasM3u8 = html.includes('.m3u8');
+  console.log('[Javtiful] extractSources: fast-stream=' + hasFastStream + 
+    ' frontWatchConfig=' + hasFrontWatch + ' m3u8=' + hasM3u8 +
+    ' htmlLen=' + html.length);
+
+  // Log snippet quanh <video> tag
+  const videoIdx = html.indexOf('<video');
+  if (videoIdx >= 0) {
+    console.log('[Javtiful] <video> snippet:', html.substring(videoIdx, videoIdx + 500).replace(/\n/g,' '));
+  }
+
+  // Method 1: fast-stream.jav.si
   const fastRe = /<source\s+src="(https:\/\/fast-stream\.jav\.si\/[^"]+)"(?:\s+type="([^"]*)")?(?:\s+size="(\d+)")?/gi;
   const fastSources = [];
   let fm;
@@ -94,15 +106,16 @@ function extractSources(html) {
     fastSources.push({ src: fm[1], type: fm[2] || 'video/mp4', size: fm[3] ? parseInt(fm[3]) : 720 });
   }
   if (fastSources.length) {
-    console.log('[Javtiful] fast-stream sources:', fastSources.length);
+    console.log('[Javtiful] fast-stream found:', fastSources.length);
     return fastSources;
   }
 
   // Method 2: frontWatchConfig JSON
-  if (html.includes('frontWatchConfig')) {
+  if (hasFrontWatch) {
     try {
       const part = html.split('id="frontWatchConfig" type="application/json">')[1];
       const raw = part.split('</script>')[0];
+      console.log('[Javtiful] frontWatchConfig raw:', raw.substring(0, 300));
       const config = JSON.parse(raw);
       const sources = (config.playerSources || []).map(s => {
         let src = s.src || '';
@@ -116,14 +129,15 @@ function extractSources(html) {
     } catch(e) { console.error('[Javtiful] frontWatchConfig error:', e.message); }
   }
 
-  // Method 3: m3u8 fallback
+  // Method 3: m3u8
   const m3u8s = html.match(/https?:\/\/[^"' >]+\.m3u8[^"' >]*/g) || [];
   if (m3u8s.length) {
-    console.log('[Javtiful] m3u8 fallback');
+    console.log('[Javtiful] m3u8:', m3u8s[0]);
     return [{ src: m3u8s[0], size: 0, type: 'application/x-mpegURL' }];
   }
 
-  console.error('[Javtiful] no sources found');
+  // Log đoạn HTML giữa trang để tìm player
+  console.log('[Javtiful] HTML[3000:4000]:', html.substring(3000,4000).replace(/\n/g,' '));
   return [];
 }
 
@@ -167,7 +181,7 @@ async function getVideoStreams(href) {
   const key = 'stream_' + href;
   const cached = detailCache.get(key);
   if (cached) return cached;
-  console.log('[Javtiful] fetching:', href);
+  console.log('[Javtiful] getVideoStreams:', href);
   const html = await getPage(href);
   if (!html) return [];
   const sources = extractSources(html);
