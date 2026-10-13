@@ -34,6 +34,16 @@ async function getPage(url) {
   }
 }
 
+// Parse /vn/video/106190/jur-687-... → id="106190", slug="jur-687-..."
+function parseVideoId(href) {
+  const m = href.match(/\/video\/(\d+)\/([^/?#]+)/);
+  if (m) return { numId: m[1], slug: m[2] };
+  // fallback: /vn/video/slug (không có số)
+  const m2 = href.match(/\/video\/([^/?#]+)/);
+  if (m2) return { numId: m2[1], slug: m2[1] };
+  return null;
+}
+
 function parseCards(html) {
   const results = [];
   const articleRe = /<article[^>]*class="[^"]*(?:video-card|front-video-card)[^"]*"[^>]*>([\s\S]*?)<\/article>/gi;
@@ -42,6 +52,7 @@ function parseCards(html) {
     const snippet = html.substring(m.index, m.index + 200);
     if (/video-card--partner|front-partner-card/.test(snippet)) continue;
     const body = m[1];
+
     let href = '';
     const hrefM = body.match(/<a[^>]+href="((?:https?:\/\/javtiful\.com)?\/(?:[a-z]{2}\/)?video\/[^"]+)"/i);
     if (hrefM) { href = hrefM[1].trim(); }
@@ -52,6 +63,10 @@ function parseCards(html) {
     if (!href) continue;
     if (href.startsWith('http') && !href.includes('javtiful.com')) continue;
     if (!href.startsWith('http')) href = MAIN_URL + href;
+
+    const parsed = parseVideoId(href);
+    if (!parsed) continue;
+
     let poster = '';
     const imgM = body.match(/<img[^>]+>/i);
     if (imgM) {
@@ -66,6 +81,7 @@ function parseCards(html) {
         }
       }
     }
+
     let title = '';
     const titleM1 = body.match(/class="[^"]*video-card__title[^"]*"[^>]*title="([^"]+)"/i);
     if (titleM1) title = unescape(titleM1[1]).trim();
@@ -77,28 +93,23 @@ function parseCards(html) {
       const altM = body.match(/\balt="([^"]+)"/i);
       if (altM) title = unescape(altM[1].replace(/^Thumbnail\s+for\s+/i,'')).trim();
     }
-    if (!title) title = href.replace(/\/$/, '').split('/').pop().replace(/-/g,' ');
-    results.push({ title, href, poster });
+    if (!title) title = parsed.slug.replace(/-/g,' ');
+
+    // Lưu cả href đầy đủ để stream dùng
+    results.push({ title, href, poster, numId: parsed.numId, slug: parsed.slug });
   }
   return results;
 }
 
 function extractSources(html) {
-  // Log 500 ký tự quanh vị trí quan trọng để debug
   const hasFastStream = html.includes('fast-stream.jav.si');
   const hasFrontWatch = html.includes('frontWatchConfig');
   const hasM3u8 = html.includes('.m3u8');
-  console.log('[Javtiful] extractSources: fast-stream=' + hasFastStream + 
+  console.log('[Javtiful] extractSources: fast-stream=' + hasFastStream +
     ' frontWatchConfig=' + hasFrontWatch + ' m3u8=' + hasM3u8 +
     ' htmlLen=' + html.length);
 
-  // Log snippet quanh <video> tag
-  const videoIdx = html.indexOf('<video');
-  if (videoIdx >= 0) {
-    console.log('[Javtiful] <video> snippet:', html.substring(videoIdx, videoIdx + 500).replace(/\n/g,' '));
-  }
-
-  // Method 1: fast-stream.jav.si
+  // Method 1: fast-stream.jav.si <source> tags
   const fastRe = /<source\s+src="(https:\/\/fast-stream\.jav\.si\/[^"]+)"(?:\s+type="([^"]*)")?(?:\s+size="(\d+)")?/gi;
   const fastSources = [];
   let fm;
@@ -115,7 +126,7 @@ function extractSources(html) {
     try {
       const part = html.split('id="frontWatchConfig" type="application/json">')[1];
       const raw = part.split('</script>')[0];
-      console.log('[Javtiful] frontWatchConfig raw:', raw.substring(0, 300));
+      console.log('[Javtiful] frontWatchConfig raw:', raw.substring(0,300));
       const config = JSON.parse(raw);
       const sources = (config.playerSources || []).map(s => {
         let src = s.src || '';
@@ -136,8 +147,7 @@ function extractSources(html) {
     return [{ src: m3u8s[0], size: 0, type: 'application/x-mpegURL' }];
   }
 
-  // Log đoạn HTML giữa trang để tìm player
-  console.log('[Javtiful] HTML[3000:4000]:', html.substring(3000,4000).replace(/\n/g,' '));
+  console.log('[Javtiful] HTML[2000:3000]:', html.substring(2000,3000).replace(/\n/g,' '));
   return [];
 }
 
@@ -173,6 +183,7 @@ async function getList(catalogId, page = 1, search = '') {
   const html = await getPage(url);
   if (!html) return [];
   const items = parseCards(html);
+  console.log('[Javtiful] catalog', catalogId, 'page', page, 'items:', items.length);
   listCache.set(key, items);
   return items;
 }
@@ -198,16 +209,26 @@ async function getVideoStreams(href) {
   return streams;
 }
 
+// ID format: javtiful:106190 (chỉ dùng numId để URL ổn định)
 function toMeta(item) {
-  const slug = item.href.replace(/\/$/, '').split('/').pop();
   return {
-    id: 'javtiful:' + slug,
+    id: 'javtiful:' + item.numId,
     type: 'movie',
     name: item.title,
     poster: item.poster || '',
     background: item.poster || '',
     description: item.title,
+    // Lưu href để stream handler dùng
+    _href: item.href,
   };
 }
 
-module.exports = { getList, getVideoStreams, toMeta, CATALOG_URLS, MAIN_URL };
+// Dùng numId để build URL: /vn/video/{numId}/{slug} → redirect về đúng trang
+// Javtiful redirect tự động nếu chỉ có numId
+async function getHrefFromId(numId) {
+  // Thử URL rút gọn: /vn/video/{numId}
+  const shortUrl = MAIN_URL + '/vn/video/' + numId;
+  return shortUrl;
+}
+
+module.exports = { getList, getVideoStreams, toMeta, getHrefFromId, CATALOG_URLS, MAIN_URL };
