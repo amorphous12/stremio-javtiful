@@ -34,6 +34,7 @@ async function getPage(url) {
   }
 }
 
+// Parse /vn/video/106190/jur-687-... → id="106190", slug="jur-687-..."
 function parseVideoId(href) {
   const m = href.match(/\/video\/(\d+)\/([^/?#]+)/);
   if (m) return { numId: m[1], slug: m[2] };
@@ -139,28 +140,26 @@ function extractSources(html) {
     console.log('[Javtiful] m3u8:', m3u8s[0]);
     return [{ src: m3u8s[0], size: 0, type: 'application/x-mpegURL' }];
   }
+
+  console.log('[Javtiful] no source found. HTML[2000:3000]:', html.substring(2000,3000).replace(/\n/g,' '));
   return [];
 }
 
 // ========== META EXTRACTION TỪ DETAIL PAGE ==========
-// Fetch trang detail để lấy title/poster/description THẬT
 async function fetchMetaFromDetail(numId, slug) {
   const key = 'meta_' + numId;
   const cached = metaCache.get(key);
   if (cached) return cached;
 
-  // Cần slug thật để URL không 404. Nếu slug rỗng, thử search.
   let url = null;
   if (slug && slug !== numId) {
     url = MAIN_URL + '/vn/video/' + numId + '/' + slug;
   }
 
   let html = '';
-  if (url) {
-    html = await getPage(url);
-  }
+  if (url) html = await getPage(url);
 
-  // Fallback: nếu URL rút gọn fail, thử search theo numId
+  // Fallback: search theo numId để tìm slug thật
   if (!html || html.length < 500) {
     console.log('[Javtiful] detail fallback, search numId:', numId);
     const searchUrl = MAIN_URL + '/vn/search?q=' + encodeURIComponent(numId);
@@ -202,7 +201,6 @@ async function fetchMetaFromDetail(numId, slug) {
     if (twImg) poster = twImg[1];
   }
   if (!poster) {
-    // Thử lấy từ player poster hoặc video tag
     const vp = html.match(/poster="([^"]+)"/i);
     if (vp) poster = vp[1];
   }
@@ -219,7 +217,6 @@ async function fetchMetaFromDetail(numId, slug) {
   }
   if (!description) description = title;
 
-  // --- Background (dùng poster nếu không có) ---
   const background = poster;
 
   const meta = { title, poster, background, description, slug, numId };
@@ -265,12 +262,52 @@ async function getList(catalogId, page = 1, search = '') {
   return items;
 }
 
-// Href được build từ numId + slug
-function buildHref(numId, slug) {
-  if (slug && slug !== numId) return MAIN_URL + '/vn/video/' + numId + '/' + slug;
-  return MAIN_URL + '/vn/video/' + numId;
+// ========== INFINITE SCROLL: tự dò page size + fetch song song ==========
+let _cachedPageSize = null;
+
+async function detectPageSize(catalogId) {
+  if (_cachedPageSize) return _cachedPageSize;
+  const items = await getList(catalogId, 1, '');
+  _cachedPageSize = items.length || 30;
+  console.log('[Javtiful] detected page size:', _cachedPageSize);
+  return _cachedPageSize;
 }
 
+async function getListFixed(catalogId, skip = 0, limit = 30, search = '') {
+  // Search: chỉ có 1 trang kết quả
+  if (search) {
+    const items = await getList(catalogId, 1, search);
+    return items.slice(skip, skip + limit);
+  }
+
+  const JAV_PAGE_SIZE = await detectPageSize(catalogId);
+
+  const startPage = Math.floor(skip / JAV_PAGE_SIZE) + 1;
+  // Fetch dư 2 trang để chắc chắn đủ limit
+  const endPage   = Math.floor((skip + limit - 1) / JAV_PAGE_SIZE) + 2;
+
+  const pageNums = [];
+  for (let p = startPage; p <= endPage; p++) pageNums.push(p);
+
+  // Fetch SONG SONG
+  const results = await Promise.all(
+    pageNums.map(p => getList(catalogId, p, '').catch(() => []))
+  );
+
+  const all = [];
+  for (const items of results) {
+    if (!items || items.length === 0) break; // hết dữ liệu
+    all.push(...items);
+  }
+
+  const offset = skip - (startPage - 1) * JAV_PAGE_SIZE;
+  const sliced = all.slice(offset, offset + limit);
+  console.log('[Javtiful] getListFixed', catalogId, 'skip=' + skip, 'limit=' + limit,
+    'pages=' + pageNums.join(','), 'returned=' + sliced.length);
+  return sliced;
+}
+
+// ========== STREAM ==========
 async function getVideoStreams(href) {
   const key = 'stream_' + href;
   const cached = detailCache.get(key);
@@ -292,7 +329,8 @@ async function getVideoStreams(href) {
   return streams;
 }
 
-// ID format: javtiful:{numId}:{slug} — giữ slug để build URL đúng
+// ========== META / ID ==========
+// ID format: javtiful:{numId}:{slug}
 function toMeta(item) {
   return {
     id: 'javtiful:' + item.numId + ':' + (item.slug || ''),
@@ -305,7 +343,6 @@ function toMeta(item) {
 }
 
 function parseStremioId(id) {
-  // id = "javtiful:106190:jur-687-..."
   const parts = id.split(':');
   if (parts[0] !== 'javtiful') return null;
   const numId = parts[1];
@@ -313,7 +350,11 @@ function parseStremioId(id) {
   return { numId, slug };
 }
 
-// Meta handler: fetch detail page để lấy title/poster THẬT
+function buildHref(numId, slug) {
+  if (slug && slug !== numId) return MAIN_URL + '/vn/video/' + numId + '/' + slug;
+  return MAIN_URL + '/vn/video/' + numId;
+}
+
 async function getMeta(id) {
   const parsed = parseStremioId(id);
   if (!parsed) return null;
@@ -329,7 +370,6 @@ async function getMeta(id) {
   };
 }
 
-// Stream handler: build URL đúng từ numId + slug
 async function getStreamsForId(id) {
   const parsed = parseStremioId(id);
   if (!parsed) return [];
@@ -345,6 +385,7 @@ async function getHrefFromId(id) {
 
 module.exports = {
   getList,
+  getListFixed,
   getVideoStreams,
   getStreamsForId,
   getMeta,
