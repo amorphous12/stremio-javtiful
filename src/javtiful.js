@@ -1,276 +1,199 @@
+
 'use strict';
 const axios = require('axios');
 const NodeCache = require('node-cache');
-const { wrapper } = require('axios-cookiejar-support');
-const { CookieJar } = require('tough-cookie');
 
+const MAIN_URL = 'https://javtiful.com';
 const listCache = new NodeCache({ stdTTL: 600 });
 const detailCache = new NodeCache({ stdTTL: 300 });
 
-const BASE = 'https://javtiful.com';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
-const jar = new CookieJar();
-const client = wrapper(axios.create({
-  jar,
-  withCredentials: true,
+const SESSION = axios.create({
   timeout: 20000,
   headers: {
-    'User-Agent': UA,
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': MAIN_URL + '/',
     'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Referer': BASE + '/',
+    'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9',
   },
-}));
+});
 
-async function fetchHtml(url) {
+function unescape(s) {
+  return (s || '').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+    .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&apos;/g,"'");
+}
+
+async function getPage(url) {
   try {
-    const res = await client.get(url, {
-      headers: { 'Referer': BASE + '/' }
-    });
-    return typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    const r = await SESSION.get(url);
+    return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
   } catch(e) {
-    console.error('[Javtiful] fetch error:', url, e.message);
-    return null;
+    console.error('[Javtiful] getPage error:', url, e.message);
+    return '';
   }
 }
 
-// ── Parse danh sách video ─────────────────────────────────────────────────────
 function parseCards(html) {
-  if (!html) return [];
-  const items = [];
-  const seen = new Set();
-
-  const articleRe = /<article[^>]*class="[^"]*front-video-card[^"]*"[^>]*>([\s\S]*?)<\/article>/gi;
+  const results = [];
+  const articleRe = /<article[^>]*class="[^"]*(?:video-card|front-video-card)[^"]*"[^>]*>([\s\S]*?)<\/article>/gi;
   let m;
   while ((m = articleRe.exec(html)) !== null) {
+    const snippet = html.substring(m.index, m.index + 200);
+    if (/video-card--partner|front-partner-card/.test(snippet)) continue;
     const body = m[1];
-    if (html.substring(m.index, m.index + 200).includes('front-partner-card')) continue;
 
-    const hrefM = body.match(/<a[^>]+href="([^"]+)"/i);
-    if (!hrefM) continue;
-    const href = hrefM[1].startsWith('http') ? hrefM[1] : BASE + hrefM[1];
-    const slug = href.replace(/^.*javtiful\.com\//, '').replace(/\/$/, '').replace(/\//g, '__');
-    if (!slug || seen.has(slug)) continue;
-    seen.add(slug);
+    let href = '';
+    const hrefM = body.match(/<a[^>]+href="((?:https?:\/\/javtiful\.com)?\/(?:[a-z]{2}\/)?video\/[^"]+)"/i);
+    if (hrefM) { href = hrefM[1].trim(); }
+    else {
+      const hrefM2 = body.match(/<a[^>]+href="([^"]+)"/i);
+      if (hrefM2) href = hrefM2[1].trim();
+    }
+    if (!href) continue;
+    if (href.startsWith('http') && !href.includes('javtiful.com')) continue;
+    if (!href.startsWith('http')) href = MAIN_URL + href;
 
     let poster = '';
     const imgM = body.match(/<img[^>]+>/i);
     if (imgM) {
       const imgTag = imgM[0];
-      const lazyM = imgTag.match(/data-front-lazy-src="([^"]+)"/i);
-      const srcM  = imgTag.match(/\bsrc="([^"]+)"/i);
-      const raw = lazyM || srcM;
-      if (raw) {
-        poster = raw[1].startsWith('/') ? BASE + raw[1] : raw[1];
-        if (poster.endsWith('.svg')) poster = '';
+      for (const attr of ['data-front-lazy-src', 'data-front-lazy-current-src', 'src']) {
+        const rawM = imgTag.match(new RegExp(attr + '="([^"]+)"', 'i'));
+        if (rawM) {
+          poster = rawM[1];
+          if (poster.startsWith('/')) poster = MAIN_URL + poster;
+          if (!poster.endsWith('.svg')) break;
+          poster = '';
+        }
       }
     }
 
     let title = '';
-    const titleA = body.match(/<a[^>]+class="[^"]*front-video-title[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
-    if (titleA) title = titleA[1].replace(/<[^>]+>/g, '').trim();
+    const titleM1 = body.match(/class="[^"]*video-card__title[^"]*"[^>]*title="([^"]+)"/i);
+    if (titleM1) title = unescape(titleM1[1]).trim();
+    if (!title) {
+      const titleM2 = body.match(/class="[^"]*(?:video-card__title|front-video-title)[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
+      if (titleM2) title = unescape(titleM2[1].replace(/<[^>]+>/g, '')).trim();
+    }
     if (!title) {
       const altM = body.match(/\balt="([^"]+)"/i);
-      if (altM) title = altM[1].replace(/^Thumbnail\s+for\s+/i, '').trim();
+      if (altM) title = unescape(altM[1].replace(/^Thumbnail\s+for\s+/i, '')).trim();
     }
-    if (!title) title = href.split('/').pop().replace(/-/g, ' ');
+    if (!title) title = href.replace(/\/$/, '').split('/').pop().replace(/-/g, ' ');
 
-    items.push({ slug, title, poster, href });
+    results.push({ title, href, poster });
+  }
+  return results;
+}
+
+function extractSources(html) {
+  // Method 1: fast-stream.jav.si <source> tags
+  const fastRe = /<source\s+src="(https:\/\/fast-stream\.jav\.si\/[^"]+)"(?:\s+type="([^"]*)")?(?:\s+size="(\d+)")?/gi;
+  const fastSources = [];
+  let fm;
+  while ((fm = fastRe.exec(html)) !== null) {
+    fastSources.push({ src: fm[1], type: fm[2] || 'video/mp4', size: fm[3] ? parseInt(fm[3]) : 720 });
+  }
+  if (fastSources.length) {
+    console.log('[Javtiful] fast-stream sources:', fastSources.length);
+    return fastSources;
   }
 
-  console.log(`[Javtiful] parseCards → ${items.length} items`);
-  return items;
-}
-
-// ── Parse actress / tag / category / channel ──────────────────────────────────
-function parseVideoTags(html) {
-  if (!html) return [];
-  const items = [];
-  const seen = new Set();
-
-  // Actresses
-  const actressRe = /<a[^>]+href="(\/vn\/actress\/[^"]+)"[^>]*class="front-watch-actor-card"[^>]*>[\s\S]*?<span>([^<]+)<\/span>/gi;
-  let m;
-  while ((m = actressRe.exec(html)) !== null) {
-    const url = BASE + m[1];
-    const label = 'Diễn viên: ' + m[2].trim();
-    if (!seen.has(url)) { seen.add(url); items.push({ label, url }); }
-  }
-
-  // Search tags
-  const tagRe = /<a[^>]+href="(\/vn\/search\?q=[^"]+)"[^>]*>([^<]+)<\/a>/gi;
-  while ((m = tagRe.exec(html)) !== null) {
-    const url = BASE + m[1];
-    const label = 'Tag: ' + m[2].trim();
-    if (label.trim() && !seen.has(url)) { seen.add(url); items.push({ label, url }); }
-  }
-
-  // Categories
-  const catRe = /<a[^>]+href="(\/vn\/category\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
-  while ((m = catRe.exec(html)) !== null) {
-    const url = BASE + m[1];
-    const label = 'Danh mục: ' + m[2].trim();
-    if (label.trim() && !seen.has(url)) { seen.add(url); items.push({ label, url }); }
-  }
-
-  // Channels
-  const chanRe = /<a[^>]+href="(\/vn\/channel\/[^"]+)"[^>]*>([^<]+)<\/a>/gi;
-  while ((m = chanRe.exec(html)) !== null) {
-    const url = BASE + m[1];
-    const label = 'Kênh: ' + m[2].trim();
-    if (label.trim() && !seen.has(url)) { seen.add(url); items.push({ label, url }); }
-  }
-
-  console.log('[Javtiful] parseVideoTags →', items.length, 'tags');
-  return items;
-}
-
-// ── Danh sách theo URL ────────────────────────────────────────────────────────
-async function getList(url, page = 1) {
-  const sep = url.includes('?') ? '&' : '?';
-  const fullUrl = page > 1 ? `${url}${sep}page=${page}` : url;
-  const key = `list_${fullUrl}`;
-  const c = listCache.get(key); if (c) return c;
-  console.log('[Javtiful] getList:', fullUrl);
-  const html = await fetchHtml(fullUrl);
-  const r = parseCards(html);
-  listCache.set(key, r); return r;
-}
-
-// ── Theo tag / actress / category URL ────────────────────────────────────────
-async function getByTag(tagUrl, page = 1) {
-  const sep = tagUrl.includes('?') ? '&' : '?';
-  const fullUrl = page > 1 ? `${tagUrl}${sep}page=${page}` : tagUrl;
-  const key = `tag_${fullUrl}`;
-  const c = listCache.get(key); if (c) return c;
-  console.log('[Javtiful] getByTag:', fullUrl);
-  const html = await fetchHtml(fullUrl);
-  const r = parseCards(html);
-  listCache.set(key, r); return r;
-}
-
-// ── Tìm kiếm ─────────────────────────────────────────────────────────────────
-async function search(keyword, page = 1) {
-  const key = `search_${keyword}_${page}`;
-  const c = listCache.get(key); if (c) return c;
-  const url = `${BASE}/vn/search?q=${encodeURIComponent(keyword)}${page > 1 ? '&page=' + page : ''}`;
-  console.log('[Javtiful] search:', url);
-  const html = await fetchHtml(url);
-  const r = parseCards(html);
-  listCache.set(key, r); return r;
-}
-
-// ── Lấy related tags từ slug phim ────────────────────────────────────────────
-async function getRelatedTags(slug) {
-  const key = `tags_${slug}`;
-  const c = detailCache.get(key); if (c) return c;
-  const path = slug.replace(/__/g, '/');
-  const url = `${BASE}/${path}`;
-  const html = await fetchHtml(url);
-  if (!html) return [];
-  const tags = parseVideoTags(html);
-  detailCache.set(key, tags);
-  return tags;
-}
-
-// ── Lấy stream từ frontWatchConfig ───────────────────────────────────────────
-async function getStream(slug) {
-  const key = `stream_${slug}`;
-  const c = detailCache.get(key); if (c) return c;
-
-  const path = slug.replace(/__/g, '/');
-  const url = `${BASE}/${path}`;
-  console.log('[Javtiful] getStream:', url);
-
-  const html = await fetchHtml(url);
-  if (!html) return null;
-
-  let sources = [];
-
-  // Path A: frontWatchConfig JSON
+  // Method 2: frontWatchConfig JSON
   if (html.includes('frontWatchConfig')) {
     try {
-      const raw = html
-        .split('id="frontWatchConfig" type="application/json">')[1]
-        .split('</script>')[0];
+      const part = html.split('id="frontWatchConfig" type="application/json">')[1];
+      const raw = part.split('</script>')[0];
       const config = JSON.parse(raw);
-      const srcs = config.playerSources || [];
-      sources = srcs.map(s => ({
-        src: s.src.startsWith('/') ? BASE + s.src : s.src,
-        size: s.size || 0,
-        type: s.type || '',
-      })).filter(s => s.src);
-      console.log('[Javtiful] frontWatchConfig sources:', sources.length);
-    } catch(e) {
-      console.error('[Javtiful] frontWatchConfig parse error:', e.message);
-    }
+      const sources = (config.playerSources || []).map(s => {
+        let src = s.src || '';
+        if (src.startsWith('/')) src = MAIN_URL + src;
+        return { src, size: s.size || 0, type: s.type || '' };
+      }).filter(s => s.src);
+      if (sources.length) {
+        console.log('[Javtiful] frontWatchConfig sources:', sources.length);
+        return sources;
+      }
+    } catch(e) { console.error('[Javtiful] frontWatchConfig error:', e.message); }
   }
 
-  // Path B: tìm m3u8 trực tiếp
-  if (!sources.length) {
-    const m3u8s = [...html.matchAll(/https?:\/\/[^"' >]+\.m3u8[^"' >]*/g)];
-    if (m3u8s.length) {
-      sources = m3u8s.map(m => ({ src: m[0], size: 0, type: 'application/x-mpegURL' }));
-      console.log('[Javtiful] m3u8 fallback:', sources.length);
-    }
+  // Method 3: m3u8 fallback
+  const m3u8s = html.match(/https?:\/\/[^"' >]+\.m3u8[^"' >]*/g) || [];
+  if (m3u8s.length) {
+    console.log('[Javtiful] m3u8 fallback');
+    return [{ src: m3u8s[0], size: 0, type: 'application/x-mpegURL' }];
   }
 
-  if (!sources.length) {
-    console.error('[Javtiful] no sources for:', url);
-    return null;
-  }
-
-  // Sort theo size giảm dần
-  sources.sort((a, b) => (b.size || 0) - (a.size || 0));
-
-  const titleM = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-  const title = titleM ? titleM[1].replace(/<[^>]+>/g, '').trim() : slug.split('__').pop();
-  const posterM = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i);
-  const poster = posterM ? posterM[1] : '';
-
-  // Parse tags cho related
-  const tags = parseVideoTags(html);
-
-  const result = { sources, title, poster, url, tags };
-  detailCache.set(key, result);
-  return result;
+  console.error('[Javtiful] no sources found');
+  return [];
 }
 
-// ── Meta ─────────────────────────────────────────────────────────────────────
+const CATALOG_URLS = {
+  'newest':           MAIN_URL + '/vn/videos',
+  'most_viewed':      MAIN_URL + '/vn/videos?sort=most_viewed',
+  'top_rated':        MAIN_URL + '/vn/videos?sort=top_rated',
+  'uncensored':       MAIN_URL + '/vn/uncensored',
+  'reducing_mosaic':  MAIN_URL + '/vn/reducing-mosaic',
+  'cat_nurse':        MAIN_URL + '/vn/category/nurse',
+  'cat_office':       MAIN_URL + '/vn/category/office-lady',
+  'cat_milf':         MAIN_URL + '/vn/category/milf',
+  'cat_student':      MAIN_URL + '/vn/category/female-student',
+  'cat_mature':       MAIN_URL + '/vn/category/mature-woman',
+  'cat_married':      MAIN_URL + '/vn/category/married-woman',
+  'cat_bigtits':      MAIN_URL + '/vn/category/big-tits',
+  'cat_amateur':      MAIN_URL + '/vn/category/amateur',
+  'cat_cosplay':      MAIN_URL + '/vn/category/cosplay',
+  'cat_chinese':      MAIN_URL + '/vn/category/chinese-av',
+};
+
+async function getList(catalogId, page = 1, search = '') {
+  let url;
+  if (search) {
+    url = MAIN_URL + '/vn/search?q=' + encodeURIComponent(search);
+  } else {
+    url = CATALOG_URLS[catalogId] || CATALOG_URLS['newest'];
+    if (page > 1) url += (url.includes('?') ? '&' : '?') + 'page=' + page;
+  }
+  const key = 'list_' + url;
+  const cached = listCache.get(key);
+  if (cached) return cached;
+  const html = await getPage(url);
+  if (!html) return [];
+  const items = parseCards(html);
+  listCache.set(key, items);
+  return items;
+}
+
+async function getVideoStreams(href) {
+  const key = 'stream_' + href;
+  const cached = detailCache.get(key);
+  if (cached) return cached;
+  console.log('[Javtiful] fetching:', href);
+  const html = await getPage(href);
+  if (!html) return [];
+  const sources = extractSources(html);
+  sources.sort((a, b) => (b.size || 0) - (a.size || 0));
+  const streams = sources.map(s => ({
+    url: s.src,
+    title: '▶ Javtiful | ' + (s.size ? s.size + 'p' : 'Auto'),
+    behaviorHints: {
+      notWebReady: false,
+      headers: { 'Referer': MAIN_URL + '/', 'Origin': MAIN_URL },
+    },
+  }));
+  if (streams.length) detailCache.set(key, streams);
+  return streams;
+}
+
 function toMeta(item) {
+  const slug = item.href.replace(/\/$/, '').split('/').pop();
   return {
-    id: `javtiful:${item.slug}`,
+    id: 'javtiful:' + slug,
     type: 'movie',
-    name: item.title || item.slug,
+    name: item.title,
     poster: item.poster || '',
     background: item.poster || '',
-    description: '',
-    language: 'ja',
+    description: item.title,
   };
 }
 
-const CATALOGS = [
-  { id: 'newest',     url: `${BASE}/vn/videos`,                        name: '🆕 Mới Nhất' },
-  { id: 'mostviewed', url: `${BASE}/vn/videos?sort=most_viewed`,       name: '🔥 Xem Nhiều Nhất' },
-  { id: 'toprated',   url: `${BASE}/vn/videos?sort=top_rated`,         name: '⭐ Đánh Giá Cao' },
-  { id: 'uncensored', url: `${BASE}/vn/uncensored`,                    name: '🔞 Không Kiểm Duyệt' },
-  { id: 'mosaic',     url: `${BASE}/vn/reducing-mosaic`,               name: '🎭 Giảm Kiểm Duyệt' },
-  { id: 'milf',       url: `${BASE}/vn/category/milf`,                 name: '👩 MILF' },
-  { id: 'bigtits',    url: `${BASE}/vn/category/big-tits`,             name: '💫 Ngực Lớn' },
-  { id: 'amateur',    url: `${BASE}/vn/category/amateur`,              name: '🎬 Nghiệp Dư' },
-  { id: 'nurse',      url: `${BASE}/vn/category/nurse`,                name: '💉 Y Tá' },
-  { id: 'student',    url: `${BASE}/vn/category/female-student`,       name: '📚 Nữ Sinh' },
-  { id: 'office',     url: `${BASE}/vn/category/office-lady`,          name: '💼 Nhân Viên VP' },
-  { id: 'mature',     url: `${BASE}/vn/category/mature-woman`,         name: '🌸 Phụ Nữ Trưởng Thành' },
-  { id: 'cosplay',    url: `${BASE}/vn/category/cosplay`,              name: '🎀 Cosplay' },
-  { id: 'married',    url: `${BASE}/vn/category/married-woman`,        name: '💍 Phụ Nữ Có Chồng' },
-  { id: 'teacher',    url: `${BASE}/vn/category/female-teacher`,       name: '👩‍🏫 Nữ Giáo Viên' },
-  { id: 'chinese',    url: `${BASE}/vn/category/chinese-av`,           name: '🇨🇳 AV Trung Quốc' },
-  { id: 'related',    url: '',                                          name: '🔗 Phim Liên Quan' },
-];
-
-module.exports = {
-  getList, getByTag, search, getStream, getRelatedTags,
-  parseVideoTags, toMeta, CATALOGS,
-};
+module.exports = { getList, getVideoStreams, toMeta, CATALOG_URLS, MAIN_URL };
