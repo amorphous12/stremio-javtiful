@@ -5,7 +5,7 @@ const jav = require('./javtiful');
 
 const manifest = {
   id: 'community.javtiful',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'Javtiful',
   description: 'Xem JAV từ Javtiful.com — Vietsub, Không kiểm duyệt',
   logo: 'https://javtiful.com/favicon.ico',
@@ -46,16 +46,16 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 
 builder.defineMetaHandler(async ({ type, id }) => {
   if (!id.startsWith('javtiful:')) return { meta: null };
-  const slug = id.replace('javtiful:', '');
-  return { meta: { id, type: 'movie', name: slug.replace(/-/g,' '), poster: '', description: '' } };
+  const numId = id.replace('javtiful:', '');
+  return { meta: { id, type: 'movie', name: numId, poster: '', description: '' } };
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
   if (!id.startsWith('javtiful:')) return { streams: [] };
   try {
-    const slug = id.replace('javtiful:', '');
-    const href = 'https://javtiful.com/vn/video/' + slug;
-    console.log('[stream] fetching:', href);
+    const numId = id.replace('javtiful:', '');
+    const href = await jav.getHrefFromId(numId);
+    console.log('[stream] id:', id, '→', href);
     const streams = await jav.getVideoStreams(href);
     console.log('[stream] found:', streams.length);
     return { streams };
@@ -67,4 +67,4 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
 const PORT = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port: PORT });
-console.log('Javtiful Addon: http://localhost:' + PORT + '/manifest.json');
+console.log('Javtiful Addon v1.3.0: http://localhost:' + PORT + '/manifest.json');
