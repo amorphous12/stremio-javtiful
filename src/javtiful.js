@@ -19,7 +19,8 @@ const SESSION = axios.create({
 
 function unescape(s) {
   return (s || '').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
-    .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&apos;/g,"'");
+    .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&apos;/g,"'")
+    .replace(/&#x27;/g,"'").replace(/&nbsp;/g,' ');
 }
 
 async function getPage(url) {
@@ -141,11 +142,11 @@ function extractSources(html) {
     return [{ src: m3u8s[0], size: 0, type: 'application/x-mpegURL' }];
   }
 
-  console.log('[Javtiful] no source found. HTML[2000:3000]:', html.substring(2000,3000).replace(/\n/g,' '));
+  console.log('[Javtiful] no source found');
   return [];
 }
 
-// ========== META EXTRACTION TỪ DETAIL PAGE ==========
+// ========== META EXTRACTION — FULL ==========
 async function fetchMetaFromDetail(numId, slug) {
   const key = 'meta_' + numId;
   const cached = metaCache.get(key);
@@ -159,7 +160,7 @@ async function fetchMetaFromDetail(numId, slug) {
   let html = '';
   if (url) html = await getPage(url);
 
-  // Fallback: search theo numId để tìm slug thật
+  // Fallback: search theo numId
   if (!html || html.length < 500) {
     console.log('[Javtiful] detail fallback, search numId:', numId);
     const searchUrl = MAIN_URL + '/vn/search?q=' + encodeURIComponent(numId);
@@ -179,7 +180,7 @@ async function fetchMetaFromDetail(numId, slug) {
     return null;
   }
 
-  // --- Title ---
+  // ===== TITLE =====
   let title = '';
   const ogTitle = html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i);
   if (ogTitle) title = unescape(ogTitle[1]).trim();
@@ -192,7 +193,7 @@ async function fetchMetaFromDetail(numId, slug) {
     if (h1) title = unescape(h1[1].replace(/<[^>]+>/g,'')).trim();
   }
 
-  // --- Poster ---
+  // ===== POSTER =====
   let poster = '';
   const ogImg = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i);
   if (ogImg) poster = ogImg[1];
@@ -207,7 +208,18 @@ async function fetchMetaFromDetail(numId, slug) {
   if (poster && poster.startsWith('/')) poster = MAIN_URL + poster;
   if (poster.endsWith('.svg')) poster = '';
 
-  // --- Description ---
+  // ===== BACKGROUND (ưu tiên ảnh ngang từ video poster) =====
+  let background = '';
+  const videoPoster = html.match(/<video[^>]+poster="([^"]+)"/i);
+  if (videoPoster) background = videoPoster[1];
+  if (!background) {
+    const previewM = html.match(/https?:\/\/[^"']+\/(?:thumb|preview|snapshot|screenshot)[^"']+\.(?:jpg|jpeg|png|webp)/i);
+    if (previewM) background = previewM[0];
+  }
+  if (!background) background = poster;
+  if (background && background.startsWith('/')) background = MAIN_URL + background;
+
+  // ===== DESCRIPTION =====
   let description = '';
   const ogDesc = html.match(/<meta[^>]+property="og:description"[^>]+content="([^"]+)"/i);
   if (ogDesc) description = unescape(ogDesc[1]).trim();
@@ -217,10 +229,168 @@ async function fetchMetaFromDetail(numId, slug) {
   }
   if (!description) description = title;
 
-  const background = poster;
+  // ===== CAST (actress / pornstar) =====
+  const cast = [];
+  // Pattern 1: <a href="/vn/pornstar/...">Name</a> hoặc /actress/, /idol/
+  const castRe = /<a[^>]+href="[^"]*\/(?:pornstar|actress|idol|stars?)\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
+  let cm;
+  while ((cm = castRe.exec(html)) !== null) {
+    const name = unescape(cm[1]).trim();
+    if (name && name.length < 60 && !cast.includes(name)) cast.push(name);
+    if (cast.length >= 10) break;
+  }
+  // Pattern 2: JSON-LD actor
+  if (!cast.length) {
+    const actorRe = /"actor"\s*:\s*\{[^}]*?"name"\s*:\s*"([^"]+)"/gi;
+    let am;
+    while ((am = actorRe.exec(html)) !== null) {
+      const name = unescape(am[1]).trim();
+      if (name && !cast.includes(name)) cast.push(name);
+    }
+  }
+  // Pattern 3: Actress label
+  if (!cast.length) {
+    const actressMeta = html.match(/(?:Actress|Diễn viên|演員)[^<]*?<[^>]+>([^<]{2,50})</i);
+    if (actressMeta) cast.push(unescape(actressMeta[1]).trim());
+  }
 
-  const meta = { title, poster, background, description, slug, numId };
-  console.log('[Javtiful] meta fetched:', numId, '| title:', title, '| poster:', !!poster);
+  // ===== GENRES (tags / categories) =====
+  const genres = [];
+  const tagRe = /<a[^>]+href="[^"]*\/(?:tag|category|categories|the-loai)\/[^"]*"[^>]*>([^<]+)<\/a>/gi;
+  let tm;
+  while ((tm = tagRe.exec(html)) !== null) {
+    const g = unescape(tm[1]).trim();
+    if (g && g.length < 50 && !genres.includes(g) && !/^(xem|more|all|view)/i.test(g)) {
+      genres.push(g);
+    }
+    if (genres.length >= 15) break;
+  }
+  // Fallback: JSON-LD genre
+  if (!genres.length) {
+    const genreRe = /"genre"\s*:\s*"([^"]+)"/gi;
+    let gm;
+    while ((gm = genreRe.exec(html)) !== null) {
+      const g = unescape(gm[1]).trim();
+      if (g && !genres.includes(g)) genres.push(g);
+    }
+  }
+
+  // ===== RUNTIME =====
+  let runtime = '';
+  // ISO 8601 duration: PT1H23M45S
+  const isoDur = html.match(/"duration"\s*:\s*"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?"/i);
+  if (isoDur) {
+    const h = parseInt(isoDur[1] || 0);
+    const m = parseInt(isoDur[2] || 0);
+    const total = h * 60 + m;
+    if (total > 0) runtime = total + ' min';
+  }
+  // Fallback: text "01:23:45" hoặc "83 min"
+  if (!runtime) {
+    const durM = html.match(/(\d{2}:\d{2}:\d{2})/);
+    if (durM) {
+      const [h, m] = durM[1].split(':').map(Number);
+      if (h < 10 && m < 60) runtime = (h * 60 + m) + ' min';
+    }
+  }
+  if (!runtime) {
+    const minM = html.match(/(\d{1,3})\s*(?:min|phút|minutes)/i);
+    if (minM) runtime = minM[1] + ' min';
+  }
+
+  // ===== RELEASE INFO / RELEASED =====
+  let releaseInfo = '';
+  let released = '';
+  const pubTime = html.match(/<meta[^>]+property="article:published_time"[^>]+content="([^"]+)"/i);
+  if (pubTime) {
+    const d = pubTime[1].split('T')[0];
+    released = d;
+    releaseInfo = d.slice(0, 4);
+  }
+  // Fallback: datePublished JSON-LD
+  if (!released) {
+    const dp = html.match(/"datePublished"\s*:\s*"([^"]+)"/i);
+    if (dp) {
+      const d = dp[1].split('T')[0];
+      released = d;
+      releaseInfo = d.slice(0, 4);
+    }
+  }
+  // Fallback: parse năm từ title
+  if (!releaseInfo) {
+    const yearM = (title + ' ' + description).match(/\b(20\d{2})\b/);
+    if (yearM) releaseInfo = yearM[1];
+  }
+
+  // ===== COUNTRY =====
+  const country = 'Japan';
+
+  // ===== WEBSITE =====
+  const website = url || (MAIN_URL + '/vn/video/' + numId);
+
+  // ===== LINKS =====
+  const links = [];
+  if (slug && slug !== numId) {
+    links.push({
+      name: 'Xem trên Javtiful',
+      category: 'Javtiful',
+      url: MAIN_URL + '/vn/video/' + numId + '/' + slug,
+    });
+  }
+
+  // ===== RELATED VIDEOS =====
+  const videos = [];
+  try {
+    // Tìm section "related" / "gợi ý" / "cùng thể loại"
+    // Cách đơn giản: parse lại toàn bộ cards trong trang detail
+    // (thường có "related videos" ở cuối)
+    const allCards = parseCards(html);
+    // Loại bỏ chính phim hiện tại
+    const related = allCards.filter(c => c.numId !== numId);
+
+    // Lấy tối đa 20 phim liên quan
+    for (const r of related.slice(0, 20)) {
+      if (!r.poster) continue;
+      videos.push({
+        id: 'javtiful:' + r.numId + ':' + (r.slug || ''),
+        title: r.title,
+        thumbnail: r.poster,
+        released: released ? new Date(released).toISOString() : new Date().toISOString(),
+      });
+    }
+  } catch (e) {
+    console.error('[Javtiful] related videos parse error:', e.message);
+  }
+
+  // ===== BUILD META =====
+  const meta = {
+    title,
+    poster,
+    background,
+    description,
+    slug,
+    numId,
+    cast,
+    genres,
+    runtime,
+    releaseInfo,
+    released,
+    country,
+    website,
+    links,
+    videos,
+  };
+
+  console.log('[Javtiful] meta fetched:', numId,
+    '| title:', (title || '').slice(0, 50),
+    '| poster:', !!poster,
+    '| bg:', !!background,
+    '| cast:', cast.length,
+    '| genres:', genres.length,
+    '| runtime:', runtime || '-',
+    '| year:', releaseInfo || '-',
+    '| videos:', videos.length);
+
   if (title) metaCache.set(key, meta);
   return meta;
 }
@@ -274,7 +444,6 @@ async function detectPageSize(catalogId) {
 }
 
 async function getListFixed(catalogId, skip = 0, limit = 30, search = '') {
-  // Search: chỉ có 1 trang kết quả
   if (search) {
     const items = await getList(catalogId, 1, search);
     return items.slice(skip, skip + limit);
@@ -283,20 +452,18 @@ async function getListFixed(catalogId, skip = 0, limit = 30, search = '') {
   const JAV_PAGE_SIZE = await detectPageSize(catalogId);
 
   const startPage = Math.floor(skip / JAV_PAGE_SIZE) + 1;
-  // Fetch dư 2 trang để chắc chắn đủ limit
   const endPage   = Math.floor((skip + limit - 1) / JAV_PAGE_SIZE) + 2;
 
   const pageNums = [];
   for (let p = startPage; p <= endPage; p++) pageNums.push(p);
 
-  // Fetch SONG SONG
   const results = await Promise.all(
     pageNums.map(p => getList(catalogId, p, '').catch(() => []))
   );
 
   const all = [];
   for (const items of results) {
-    if (!items || items.length === 0) break; // hết dữ liệu
+    if (!items || items.length === 0) break;
     all.push(...items);
   }
 
@@ -330,7 +497,6 @@ async function getVideoStreams(href) {
 }
 
 // ========== META / ID ==========
-// ID format: javtiful:{numId}:{slug}
 function toMeta(item) {
   return {
     id: 'javtiful:' + item.numId + ':' + (item.slug || ''),
@@ -358,16 +524,31 @@ function buildHref(numId, slug) {
 async function getMeta(id) {
   const parsed = parseStremioId(id);
   if (!parsed) return null;
-  const meta = await fetchMetaFromDetail(parsed.numId, parsed.slug);
-  if (!meta) return null;
-  return {
+  const m = await fetchMetaFromDetail(parsed.numId, parsed.slug);
+  if (!m) return null;
+
+  const meta = {
     id,
     type: 'movie',
-    name: meta.title || parsed.slug || parsed.numId,
-    poster: meta.poster || '',
-    background: meta.background || meta.poster || '',
-    description: meta.description || meta.title || '',
+    name: m.title || parsed.slug || parsed.numId,
+    poster: m.poster || '',
+    background: m.background || m.poster || '',
+    description: m.description || m.title || '',
   };
+
+  // Optional fields
+  if (m.cast && m.cast.length)      meta.cast = m.cast;
+  if (m.genres && m.genres.length)  meta.genres = m.genres;
+  if (m.runtime)                    meta.runtime = m.runtime;
+  if (m.releaseInfo)                meta.releaseInfo = m.releaseInfo;
+  if (m.released)                   meta.released = m.released;
+  if (m.country)                    meta.country = m.country;
+  if (m.website)                    meta.website = m.website;
+  if (m.links && m.links.length)    meta.links = m.links;
+  if (m.videos && m.videos.length)  meta.videos = m.videos;
+
+  console.log('[Javtiful] getMeta returning fields:', Object.keys(meta).join(','));
+  return meta;
 }
 
 async function getStreamsForId(id) {
